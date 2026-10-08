@@ -1,0 +1,4 @@
+interface:
+  display_name: "Alibaba Mail"
+  short_description: "Find project context in email and attachments"
+  default_prompt: "Use $alibaba-mail to find the correspondence and attachments relevant to my current project."

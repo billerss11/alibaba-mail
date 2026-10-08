@@ -1,0 +1,19 @@
+# Only skill source, documentation, and synthetic tests belong in this public repo.
+*
+!.gitignore
+!SKILL.md
+!README.md
+!requirements.txt
+!agents/
+!agents/openai.yaml
+!references/
+!references/*.md
+!scripts/
+!scripts/*.py
+!tests/
+!tests/test_*.py
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+
+# No account settings, passwords, real mail, attachments, logs, or exports.
