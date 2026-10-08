@@ -19,6 +19,7 @@ from contextlib import contextmanager, suppress
 from datetime import date, datetime, timezone
 from email import policy
 from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from uuid import uuid4
@@ -146,6 +147,7 @@ def find_uids(client, since, before, sender=None, recipient=None):
         criteria.extend(["SINCE", imap_date(since)])
     if before:
         criteria.extend(["BEFORE", imap_date(before)])
+    date_criteria = criteria.copy()
     # Let the server narrow ASCII addresses quickly; decode other header filters locally.
     for name, value in (("FROM", sender), ("RECIPIENT", recipient)):
         if value and re.fullmatch(r"[A-Za-z0-9._%+\-]*@[A-Za-z0-9.\-]+", value):
@@ -154,24 +156,55 @@ def find_uids(client, since, before, sender=None, recipient=None):
                 criteria.extend(["FROM", quoted])
             else:
                 criteria.extend(["OR", "TO", quoted, "OR", "CC", quoted, "BCC", quoted])
-    status, data = client.uid("SEARCH", None, *criteria)
+    try:
+        status, data = client.uid("SEARCH", None, *criteria)
+    except imaplib.IMAP4.abort:
+        raise
+    except imaplib.IMAP4.error:
+        if criteria == date_criteria:
+            raise
+        # Some Alibaba servers reject FROM/recipient narrowing. The local
+        # decoded-header filter remains authoritative, so retry once without it.
+        status, data = client.uid("SEARCH", None, *date_criteria)
+    else:
+        if status != "OK" and criteria != date_criteria:
+            status, data = client.uid("SEARCH", None, *date_criteria)
     if status != "OK":
         raise RuntimeError("The server could not search this folder.")
     return [int(uid) for uid in (data[0] or b"").split()]
 
 
-def fetch_messages(client, uids, headers_only=False):
-    fields = "(UID BODY.PEEK[HEADER])" if headers_only else "(UID BODY.PEEK[])"
+def fetch_messages(client, uids, headers_only=False, metadata=None):
+    fields = "(UID INTERNALDATE BODY.PEEK[HEADER])" if headers_only else "(UID INTERNALDATE BODY.PEEK[])"
     status, data = client.uid("FETCH", ",".join(map(str, uids)), fields)
     if status != "OK":
         raise RuntimeError("The server could not fetch the requested message(s).")
     found = {}
     requested = set(uids)
+    descriptor, raw = b"", None
+
+    def collect():
+        match = re.search(rb"\bUID\s+(\d+)\b", descriptor)
+        if raw is None or not match or int(match[1]) not in requested:
+            return
+        uid = int(match[1])
+        found[uid] = raw
+        if metadata is not None:
+            stamp = re.search(rb'\bINTERNALDATE\s+"([^"]+)"', descriptor, re.IGNORECASE)
+            received_at = None
+            if stamp:
+                with suppress(ValueError, TypeError, OverflowError):
+                    received_at = parsedate_to_datetime(stamp[1].decode("ascii")).isoformat()
+            metadata[uid] = {"received_at": received_at}
+
     for item in data:
         if isinstance(item, tuple) and isinstance(item[1], bytes):
-            match = re.search(rb"\bUID\s+(\d+)\b", item[0])
-            if match and int(match[1]) in requested:
-                found[int(match[1])] = item[1]
+            collect()
+            descriptor, raw = item
+        elif isinstance(item, bytes) and raw is not None:
+            # UID/INTERNALDATE may follow the body literal in a FETCH response.
+            descriptor += b" " + item
+    collect()
     return found
 
 
@@ -267,12 +300,19 @@ class PlainHTML(HTMLParser):
             self.chunks.append(data)
 
 
-def readable_body(record):
-    if record["text"].strip():
-        return record["text"]
+def html_text(html):
     parser = PlainHTML()
-    parser.feed(record["html"])
+    parser.feed(html)
     return "".join(parser.chunks)
+
+
+def readable_body(record):
+    return record["text"] if record["text"].strip() else html_text(record["html"])
+
+
+def searchable_body(record):
+    # Plain/HTML alternatives can differ. Search both even when displaying plain text.
+    return record["text"] + "\n" + html_text(record["html"])
 
 
 def compact_record(record, max_chars):
@@ -335,6 +375,9 @@ def iter_matches(client, args, stats):
     folders = ([entry["name"] for entry in list_folders(client) if entry["selectable"]]
                if args.all_folders else (args.folder or ["INBOX"]))
     needs_headers = args.command == "search" or any((args.sender, args.recipient, args.subject, args.header, args.text))
+    sorted_by_received = getattr(args, "sort", "uid-desc") != "uid-desc"
+    unfiltered_headers = not any((args.sender, args.recipient, args.subject, args.header, args.text))
+    batch_size = min(100, args.limit) if unfiltered_headers and args.limit and not sorted_by_received else 100
     for folder in dict.fromkeys(folders):
         print(f"Scanning folder: {folder}", file=sys.stderr)
         try:
@@ -347,9 +390,10 @@ def iter_matches(client, args, stats):
             continue
         stats["folders"].append(folder)
         stats["candidates"] += len(uids)
-        for start in range(0, len(uids), 100):
-            batch = uids[start:start + 100]
-            headers = fetch_messages(client, batch, headers_only=True) if needs_headers else {}
+        for start in range(0, len(uids), batch_size):
+            batch = uids[start:start + batch_size]
+            metadata = {}
+            headers = fetch_messages(client, batch, headers_only=True, metadata=metadata) if needs_headers else {}
             for uid in batch:
                 record = {}
                 if needs_headers:
@@ -361,21 +405,24 @@ def iter_matches(client, args, stats):
                     if not matches(message, args):
                         continue
                     record = summary(message)
+                    record.update(metadata.get(uid, {}))
                 if args.text:
                     raw = fetch_messages(client, [uid]).get(uid)
                     if raw is None:
                         stats["errors"].append(f"{folder} UID {uid}: missing or moved during body search")
                         continue
                     content, _ = message_content(raw)
-                    body = readable_body(content)
+                    body = searchable_body(content)
                     position = body.casefold().find(args.text.casefold())
                     if position < 0:
                         continue
                     record["snippet"] = body[max(0, position - 80):position + 160]
+                    if args.command == "export":
+                        record["_raw"] = raw
                 record.update(folder=folder, uidvalidity=validity, uid=str(uid))
                 stats["matches"] += 1
                 yield record
-                if args.limit and stats["matches"] >= args.limit:
+                if args.limit and stats["matches"] >= args.limit and not sorted_by_received:
                     stats["limit_reached"] = True
                     return
 
@@ -385,6 +432,17 @@ def run_search_or_export(client, args):
              "matches": 0, "limit_reached": False, "errors": []}
     if args.command == "search":
         results = list(iter_matches(client, args, stats))
+        if args.sort != "uid-desc":
+            missing = sum(not item.get("received_at") for item in results)
+            if missing:
+                stats["errors"].append(f"{missing} message(s) lack INTERNALDATE; received-date ordering is incomplete.")
+            def received_key(item):
+                return (datetime.fromisoformat(item["received_at"]).timestamp()
+                        if item.get("received_at") else float("-inf" if args.sort == "received-desc" else "inf"))
+            results.sort(key=received_key, reverse=args.sort == "received-desc")
+            if args.limit and len(results) > args.limit:
+                results = results[:args.limit]
+                stats["limit_reached"] = True
         emit({"results": results, **stats,
               "complete": not stats["errors"] and not stats["limit_reached"]})
         return 1 if stats["errors"] else 0
@@ -406,11 +464,15 @@ def run_search_or_export(client, args):
                     skipped += 1
                     outcome = "already_saved"
                 else:
-                    raw = fetch_messages(client, [int(record["uid"])]).get(int(record["uid"]))
+                    raw = record.pop("_raw", None)
+                    metadata = {}
+                    if raw is None:
+                        raw = fetch_messages(client, [int(record["uid"])], metadata=metadata).get(int(record["uid"]))
                     if raw is None:
                         stats["errors"].append(f"{record['folder']} UID {record['uid']}: missing or moved during export")
                         continue
-                    save_message(target, raw, identity)
+                    received_at = metadata.get(int(record["uid"]), {}).get("received_at") or record.get("received_at")
+                    save_message(target, raw, {**identity, "received_at": received_at})
                     saved += 1
                     outcome = "saved"
                 log.write(json.dumps({**identity, "directory": str(target), "status": outcome}, ensure_ascii=False) + "\n")
@@ -430,19 +492,26 @@ def run_read(client, args):
     validity = select_folder(client, args.folder)
     if args.uidvalidity and str(args.uidvalidity) != validity:
         raise RuntimeError("Folder UIDVALIDITY changed. Search again before using this UID.")
-    raw = fetch_messages(client, [args.uid]).get(args.uid)
+    metadata = {}
+    raw = fetch_messages(client, [args.uid], headers_only=args.headers_only, metadata=metadata).get(args.uid)
     if raw is None:
         raise RuntimeError("Message not found; it may have been moved or deleted by another client.")
     identity = {"folder": args.folder, "uidvalidity": validity, "uid": str(args.uid)}
+    if args.headers_only:
+        message = parse_message(raw)
+        emit({**summary(message), **identity, **metadata.get(args.uid, {}),
+              "headers": [[name, str(value)] for name, value in message.items()], "body_fetched": False})
+        return 0
     record, _ = message_content(raw)
     record.update(identity)
+    record.update(metadata.get(args.uid, {}))
     if args.output:
         root = validate_output(args.output)
         target = message_path(root, f"{args.host}:{args.port}", args.user, args.folder, validity, args.uid)
         if not target.resolve().is_relative_to(root):
             raise ValueError("Export path points outside the output directory.")
         if not is_saved(target, identity):
-            save_message(target, raw, identity)
+            save_message(target, raw, {**identity, **metadata.get(args.uid, {})})
         record["saved_to"] = str(target)
     emit(record if args.full else compact_record(record, args.max_chars))
     return 0
@@ -475,6 +544,9 @@ def parser_for(config):
         sub.add_argument("--before", help="Exclusive server internal date, YYYY-MM-DD")
         sub.add_argument("--limit", type=int, default=10 if command == "search" else 0,
                          help="Maximum matches across selected folders; 0 means unlimited")
+        if command == "search":
+            sub.add_argument("--sort", choices=("uid-desc", "received-desc", "received-asc"), default="uid-desc",
+                             help="Received-date sorts scan all candidates across selected folders before applying the limit")
         if command == "export":
             sub.add_argument("--output", type=Path, required=True, help="Directory outside this skill/repository")
     read = commands.add_parser("read", parents=[shared], help="Read a complete message and optionally save attachments")
@@ -483,7 +555,9 @@ def parser_for(config):
     read.add_argument("--uidvalidity", type=int, help="Value from search; rejects stale mailbox identity")
     read.add_argument("--output", type=Path, help="Save raw message, bodies, headers, and all attachments here")
     read.add_argument("--max-chars", type=int, default=8000, help="Maximum body characters in normal read output")
-    read.add_argument("--full", action="store_true", help="Return all headers, complete plain text, and HTML")
+    read_mode = read.add_mutually_exclusive_group()
+    read_mode.add_argument("--full", action="store_true", help="Return all headers, complete plain text, and HTML")
+    read_mode.add_argument("--headers-only", action="store_true", help="Fetch headers and received time without downloading bodies/attachments")
     return parser
 
 
@@ -503,6 +577,8 @@ def main():
             parser.error("Limit must be nonnegative; UID must be positive.")
         if getattr(args, "max_chars", 1) < 1:
             parser.error("--max-chars must be positive; use --full for unlimited output.")
+        if getattr(args, "headers_only", False) and args.output:
+            parser.error("--headers-only cannot be combined with --output; exporting requires the complete message.")
         for name in ("since", "before"):
             if getattr(args, name, None):
                 imap_date(getattr(args, name))
@@ -528,7 +604,8 @@ def main():
                 list_folders(client)
             credential_store().set_password(credential_service(args), args.user, password)
             STATE_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text(json.dumps({"user": args.user, "host": args.host, "port": args.port}, indent=2), encoding="utf-8")
+            CONFIG_PATH.write_text(json.dumps({"user": args.user, "host": args.host, "port": args.port,
+                                               "python": sys.executable}, indent=2), encoding="utf-8")
             emit({"authenticated": True, "credential_saved": True, "config": str(CONFIG_PATH)})
             return 0
         with connect(args) as client:

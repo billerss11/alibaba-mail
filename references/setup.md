@@ -12,7 +12,9 @@ In a local interactive terminal, run:
 python <skill-directory>/scripts/mail.py auth --user you@your-domain.com
 ```
 
-Enter Alibaba's **third-party client security password / authorization code** at the hidden prompt. The command verifies login, saves the credential in the OS credential store (Windows Credential Manager on Windows), and stores nonsecret host/port/account settings in `%LOCALAPPDATA%/Codex/alibaba-mail/config.json`. On other platforms the settings directory is `~/.config/Codex/alibaba-mail`. A working OS keyring is required for saved credentials.
+Enter Alibaba's **third-party client security password / authorization code** at the hidden prompt. The command verifies login, saves the credential in the OS credential store (Windows Credential Manager on Windows), and stores nonsecret host/port/account settings plus the current Python executable in `%LOCALAPPDATA%/Codex/alibaba-mail/config.json`. On other platforms the settings directory is `~/.config/Codex/alibaba-mail`. A working OS keyring is required for saved credentials.
+
+For routine queries, invoke the configured `python` path directly instead of starting `conda run` each time. If that interpreter moves, locate the existing environment once and update this nonsecret path; credential setup need not be repeated. Do not run `status`, `check`, or `folders` as a preflight for every query.
 
 Future agent runs under the same OS user retrieve the credential automatically. `status` checks availability without logging in; `check` tests authenticated access. After a password change, run `auth` again. No password is written to the skill folder.
 
