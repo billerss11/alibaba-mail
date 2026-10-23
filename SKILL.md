@@ -1,11 +1,15 @@
 ---
 name: alibaba-mail
-description: Consult the configured Alibaba Mail account for project context, correspondence, decisions, documents, or attachments; search by sender, recipient, subject, body, or other headers, and retrieve or export messages through IMAP.
+description: Read, search, or export messages and attachments from the configured Alibaba Mail account via IMAP only when the user explicitly invokes $alibaba-mail or asks to activate this skill. Do not activate automatically for project context.
 ---
 
 # Alibaba Mail
 
 Find email evidence for the current project, then bring back the relevant facts or attachments. This skill reads mail; it does not send or change it.
+
+## Activation
+
+Use only when the user explicitly requests this skill for an email task. Authorization covers that task and its relevant follow-ups; it does not carry over to unrelated tasks. Discussing, reviewing, or editing this skill does not authorize mailbox access.
 
 ## Run
 
